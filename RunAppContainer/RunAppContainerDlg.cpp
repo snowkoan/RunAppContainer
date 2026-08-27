@@ -18,6 +18,14 @@ std::wstring GetControlText(HWND dialog, int controlId) {
 	return text;
 }
 
+void SetOutputText(HWND dialog, const std::wstring& text) {
+	const auto output = GetDlgItem(dialog, IDC_INFO);
+	SetWindowTextW(output, text.c_str());
+	const auto end = static_cast<WPARAM>(text.size());
+	SendMessageW(output, EM_SETSEL, end, end);
+	SendMessageW(output, EM_SCROLLCARET, 0, 0);
+}
+
 std::wstring FormatSystemError(DWORD error) {
 	wil::unique_hlocal_string rawMessage;
 	const DWORD length = FormatMessageW(
@@ -261,12 +269,12 @@ void RunExecutable(HWND dialog) {
 		const auto errorText = FormatSystemError(error);
 		log += errorText;
 		log += L"\r\n";
-		SetDlgItemTextW(dialog, IDC_INFO, log.c_str());
+		SetOutputText(dialog, log);
 		MessageBoxW(dialog, errorText.c_str(), L"RunAppContainer", MB_OK | MB_ICONERROR);
 		return;
 	}
 
-	SetDlgItemTextW(dialog, IDC_INFO, log.c_str());
+	SetOutputText(dialog, log);
 }
 
 INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM) {
