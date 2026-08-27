@@ -1,291 +1,348 @@
-
-// RunAppContainerDlg.cpp : implementation file
-//
-
 #include "stdafx.h"
 #include "RunAppContainer.h"
 #include "RunAppContainerDlg.h"
 
-#pragma comment(lib, "userenv")
+namespace {
 
-#ifdef _DEBUG
-#define new DEBUG_NEW
-#endif
+using unique_proc_thread_attribute_list = wil::unique_any<
+	LPPROC_THREAD_ATTRIBUTE_LIST,
+	decltype(&::DeleteProcThreadAttributeList),
+	::DeleteProcThreadAttributeList>;
 
-
-// CAboutDlg dialog used for App About
-
-class CAboutDlg : public CDialogEx {
-public:
-	CAboutDlg();
-
-	// Dialog Data
-#ifdef AFX_DESIGN_TIME
-	enum { IDD = IDD_ABOUTBOX };
-#endif
-
-protected:
-	virtual void DoDataExchange(CDataExchange* pDX);    // DDX/DDV support
-
-// Implementation
-protected:
-	DECLARE_MESSAGE_MAP()
-};
-
-CAboutDlg::CAboutDlg() : CDialogEx(IDD_ABOUTBOX) {
+std::wstring GetControlText(HWND dialog, int controlId) {
+	const auto control = GetDlgItem(dialog, controlId);
+	const int length = GetWindowTextLengthW(control);
+	std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+	const int copied = GetWindowTextW(control, text.data(), length + 1);
+	text.resize(static_cast<size_t>(copied));
+	return text;
 }
 
-void CAboutDlg::DoDataExchange(CDataExchange* pDX) {
-	CDialogEx::DoDataExchange(pDX);
+std::wstring FormatSystemError(DWORD error) {
+	wil::unique_hlocal_string rawMessage;
+	const DWORD length = FormatMessageW(
+		FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		nullptr,
+		error,
+		0,
+		reinterpret_cast<PWSTR>(rawMessage.put()),
+		0,
+		nullptr);
+
+	std::wstring result = L"Error " + std::to_wstring(error);
+	if (length != 0) {
+		std::wstring_view message(rawMessage.get(), length);
+		while (!message.empty() && (message.back() == L'\r' || message.back() == L'\n' || message.back() == L' '))
+			message.remove_suffix(1);
+		result += L": ";
+		result.append(message);
+	}
+	return result;
 }
 
-BEGIN_MESSAGE_MAP(CAboutDlg, CDialogEx)
-END_MESSAGE_MAP()
-
-
-// CRunAppContainerDlg dialog
-
-
-
-CRunAppContainerDlg::CRunAppContainerDlg(CWnd* pParent /*=nullptr*/)
-	: CDialogEx(IDD_RUNAPPCONTAINER_DIALOG, pParent) {
-	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
+std::vector<std::wstring> SplitLines(std::wstring_view text) {
+	std::vector<std::wstring> lines;
+	size_t position = 0;
+	while (position <= text.size()) {
+		const size_t end = text.find(L'\n', position);
+		const size_t count = end == std::wstring_view::npos ? text.size() - position : end - position;
+		auto line = text.substr(position, count);
+		if (!line.empty() && line.back() == L'\r')
+			line.remove_suffix(1);
+		if (!line.empty())
+			lines.emplace_back(line);
+		if (end == std::wstring_view::npos)
+			break;
+		position = end + 1;
+	}
+	return lines;
 }
 
-void CRunAppContainerDlg::DoDataExchange(CDataExchange* pDX) {
-	CDialogEx::DoDataExchange(pDX);
+bool AllowNamedObjectAccess(
+	PSID appContainerSid,
+	const std::wstring& name,
+	SE_OBJECT_TYPE type,
+	ACCESS_MASK accessMask,
+	DWORD& error) {
+	PACL oldAcl = nullptr;
+	PSECURITY_DESCRIPTOR rawSecurityDescriptor = nullptr;
+	DWORD status = GetNamedSecurityInfoW(
+		const_cast<PWSTR>(name.c_str()),
+		type,
+		DACL_SECURITY_INFORMATION,
+		nullptr,
+		nullptr,
+		&oldAcl,
+		nullptr,
+		&rawSecurityDescriptor);
+	wil::unique_hlocal_ptr<> securityDescriptor(rawSecurityDescriptor);
+	if (status != ERROR_SUCCESS) {
+		error = status;
+		return false;
+	}
+
+	EXPLICIT_ACCESSW access{};
+	access.grfAccessMode = GRANT_ACCESS;
+	access.grfAccessPermissions = accessMask;
+	access.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+	access.Trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
+	access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+	access.Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+	access.Trustee.ptstrName = static_cast<PWSTR>(appContainerSid);
+
+	PACL rawNewAcl = nullptr;
+	status = SetEntriesInAclW(1, &access, oldAcl, &rawNewAcl);
+	wil::unique_hlocal_ptr<> newAcl(rawNewAcl);
+	if (status != ERROR_SUCCESS) {
+		error = status;
+		return false;
+	}
+
+	status = SetNamedSecurityInfoW(
+		const_cast<PWSTR>(name.c_str()),
+		type,
+		DACL_SECURITY_INFORMATION,
+		nullptr,
+		nullptr,
+		static_cast<PACL>(newAcl.get()),
+		nullptr);
+	if (status != ERROR_SUCCESS) {
+		error = status;
+		return false;
+	}
+
+	return true;
 }
 
-BEGIN_MESSAGE_MAP(CRunAppContainerDlg, CDialogEx)
-	ON_WM_SYSCOMMAND()
-	ON_WM_PAINT()
-	ON_WM_QUERYDRAGICON()
-	ON_BN_CLICKED(IDC_BROWSE, &CRunAppContainerDlg::OnBnClickedBrowse)
-	ON_BN_CLICKED(IDC_RUN, &CRunAppContainerDlg::OnBnClickedRun)
-END_MESSAGE_MAP()
-
-
-// CRunAppContainerDlg message handlers
-
-BOOL CRunAppContainerDlg::OnInitDialog() {
-	CDialogEx::OnInitDialog();
-
-	// Add "About..." menu item to system menu.
-
-	// IDM_ABOUTBOX must be in the system command range.
-	ASSERT((IDM_ABOUTBOX & 0xFFF0) == IDM_ABOUTBOX);
-	ASSERT(IDM_ABOUTBOX < 0xF000);
-
-	CMenu* pSysMenu = GetSystemMenu(FALSE);
-	if (pSysMenu != nullptr) {
-		BOOL bNameValid;
-		CString strAboutMenu;
-		bNameValid = strAboutMenu.LoadString(IDS_ABOUTBOX);
-		ASSERT(bNameValid);
-		if (!strAboutMenu.IsEmpty()) {
-			pSysMenu->AppendMenu(MF_SEPARATOR);
-			pSysMenu->AppendMenu(MF_STRING, IDM_ABOUTBOX, strAboutMenu);
+bool ExecuteAppContainer(
+	const std::wstring& containerName,
+	const std::wstring& commandLine,
+	const std::wstring& files,
+	const std::wstring& registry,
+	std::wstring& log,
+	DWORD& error) {
+	wil::unique_sid appContainerSid;
+	HRESULT result = CreateAppContainerProfile(
+		containerName.c_str(),
+		containerName.c_str(),
+		containerName.c_str(),
+		nullptr,
+		0,
+		appContainerSid.put());
+	if (FAILED(result)) {
+		result = DeriveAppContainerSidFromAppContainerName(containerName.c_str(), appContainerSid.put());
+		if (FAILED(result)) {
+			error = HRESULT_CODE(result);
+			return false;
 		}
 	}
 
-	// Set the icon for this dialog.  The framework does this automatically
-	//  when the application's main window is not a dialog
-	SetIcon(m_hIcon, TRUE);			// Set big icon
-	SetIcon(m_hIcon, FALSE);		// Set small icon
-
-	// TODO: Add extra initialization here
-
-	return TRUE;  // return TRUE  unless you set the focus to a control
-}
-
-void CRunAppContainerDlg::OnSysCommand(UINT nID, LPARAM lParam) {
-	if ((nID & 0xFFF0) == IDM_ABOUTBOX) {
-		CAboutDlg dlgAbout;
-		dlgAbout.DoModal();
+	wil::unique_hlocal_string sidString;
+	if (!ConvertSidToStringSidW(appContainerSid.get(), sidString.put())) {
+		error = GetLastError();
+		return false;
 	}
-	else {
-		CDialogEx::OnSysCommand(nID, lParam);
-	}
-}
+	log += L"AppContainer SID:\r\n";
+	log += sidString.get();
+	log += L"\r\n";
 
-// If you add a minimize button to your dialog, you will need the code below
-//  to draw the icon.  For MFC applications using the document/view model,
-//  this is automatically done for you by the framework.
-
-void CRunAppContainerDlg::OnPaint() {
-	if (IsIconic()) {
-		CPaintDC dc(this); // device context for painting
-
-		SendMessage(WM_ICONERASEBKGND, reinterpret_cast<WPARAM>(dc.GetSafeHdc()), 0);
-
-		// Center icon in client rectangle
-		int cxIcon = GetSystemMetrics(SM_CXICON);
-		int cyIcon = GetSystemMetrics(SM_CYICON);
-		CRect rect;
-		GetClientRect(&rect);
-		int x = (rect.Width() - cxIcon + 1) / 2;
-		int y = (rect.Height() - cyIcon + 1) / 2;
-
-		// Draw the icon
-		dc.DrawIcon(x, y, m_hIcon);
-	}
-	else {
-		CDialogEx::OnPaint();
-	}
-}
-
-HCURSOR CRunAppContainerDlg::OnQueryDragIcon() {
-	return static_cast<HCURSOR>(m_hIcon);
-}
-
-
-void CRunAppContainerDlg::OnBnClickedBrowse() {
-	CFileDialog dlg(TRUE, L"exe", nullptr, OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER, L"Executables (*.exe)|*.exe||", this);
-	if (dlg.DoModal() == IDOK)
-		SetDlgItemText(IDC_EXEPATH, dlg.GetPathName());
-}
-
-
-void CRunAppContainerDlg::OnBnClickedRun() {
-	CString containerName;
-	GetDlgItemText(IDC_NAME, containerName);
-	if (containerName.IsEmpty()) {
-		AfxMessageBox(L"Container name cannot be empty");
-		return;
+	wil::unique_cotaskmem_string folderPath;
+	if (SUCCEEDED(GetAppContainerFolderPath(sidString.get(), folderPath.put()))) {
+		log += L"AppContainer folder: ";
+		log += folderPath.get();
+		log += L"\r\n";
 	}
 
-	CString exePath;
-	GetDlgItemText(IDC_EXEPATH, exePath);
-	if (exePath.IsEmpty()) {
-		AfxMessageBox(L"Executable path must be specified");
-		return;
+	SECURITY_CAPABILITIES securityCapabilities{};
+	securityCapabilities.AppContainerSid = appContainerSid.get();
+
+	SIZE_T attributeListSize = 0;
+	InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeListSize);
+	if (attributeListSize == 0) {
+		error = GetLastError();
+		return false;
+	}
+	std::vector<BYTE> attributeBuffer(attributeListSize);
+	const auto rawAttributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributeBuffer.data());
+	if (!InitializeProcThreadAttributeList(rawAttributes, 1, 0, &attributeListSize)) {
+		error = GetLastError();
+		return false;
+	}
+	unique_proc_thread_attribute_list attributes(rawAttributes);
+	if (!UpdateProcThreadAttribute(
+		attributes.get(),
+		0,
+		PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+		&securityCapabilities,
+		sizeof(securityCapabilities),
+		nullptr,
+		nullptr)) {
+		error = GetLastError();
+		return false;
 	}
 
-	CString files, registry;
-	GetDlgItemText(IDC_FILES, files);
-	GetDlgItemText(IDC_REGISTRY, registry);
-
-	CString log;
-	GetDlgItemText(IDC_INFO, log);
-	bool ok = ExecuteAppContainer(containerName, exePath, files, registry, log);
-	SetDlgItemText(IDC_INFO, log);
-	if (!ok)
-		AfxMessageBox(L"Failed!");
-}
-
-bool CRunAppContainerDlg::AllowNamedObjectAccess(PSID appContainerSid, PWSTR name, SE_OBJECT_TYPE type, ACCESS_MASK accessMask) {
-	PACL oldAcl, newAcl = nullptr;
-	DWORD status;
-	EXPLICIT_ACCESS access;
-	do {
-		access.grfAccessMode = GRANT_ACCESS;
-		access.grfAccessPermissions = accessMask;
-		access.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
-		access.Trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
-		access.Trustee.pMultipleTrustee = nullptr;
-		access.Trustee.ptstrName = (PWSTR)appContainerSid;
-		access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-		access.Trustee.TrusteeType = TRUSTEE_IS_GROUP;
-
-		status = GetNamedSecurityInfo(name, type, DACL_SECURITY_INFORMATION, nullptr, nullptr, &oldAcl, nullptr, nullptr);
-		if (status != ERROR_SUCCESS)
+	for (const auto& file : SplitLines(files)) {
+		if (!AllowNamedObjectAccess(appContainerSid.get(), file, SE_FILE_OBJECT, FILE_ALL_ACCESS, error))
 			return false;
-
-		status = SetEntriesInAcl(1, &access, oldAcl, &newAcl);
-		if (status != ERROR_SUCCESS)
-			return false;
-
-		status = SetNamedSecurityInfo(name, type, DACL_SECURITY_INFORMATION, nullptr, nullptr, newAcl, nullptr);
-		if (status != ERROR_SUCCESS)
-			break;
-	} while (false);
-
-	if (newAcl)
-		::LocalFree(newAcl);
-
-	ASSERT(status == ERROR_SUCCESS);
-	return status == ERROR_SUCCESS;
-}
-
-bool CRunAppContainerDlg::ExecuteAppContainer(const CString & containerName, CString & exePath, const CString & files, const CString & registry, CString& log) {
-	PSID appContainerSid;
-	auto hr = ::CreateAppContainerProfile(containerName, containerName, containerName, nullptr, 0, &appContainerSid);
-	if (FAILED(hr)) {
-		// see if AppContainer SID already exists
-		hr = ::DeriveAppContainerSidFromAppContainerName(containerName, &appContainerSid);
-		if (FAILED(hr))
+	}
+	for (const auto& key : SplitLines(registry)) {
+		if (!AllowNamedObjectAccess(appContainerSid.get(), key, SE_REGISTRY_WOW64_32KEY, KEY_ALL_ACCESS, error))
 			return false;
 	}
 
-	PWSTR str;
-	::ConvertSidToStringSid(appContainerSid, &str);
-	((log += L"AppContainer SID:\r\n") += str) += L"\r\n";
+	std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
+	mutableCommandLine.push_back(L'\0');
 
-	PWSTR path;
-	if (SUCCEEDED(::GetAppContainerFolderPath(str, &path))) {
-		((log += L"AppContainer folder: ") += path) += L"\r\n";
-		::CoTaskMemFree(path);
+	STARTUPINFOEXW startupInfo{};
+	startupInfo.StartupInfo.cb = sizeof(startupInfo);
+	startupInfo.lpAttributeList = attributes.get();
+	wil::unique_process_information processInfo;
+	if (!CreateProcessW(
+		nullptr,
+		mutableCommandLine.data(),
+		nullptr,
+		nullptr,
+		FALSE,
+		EXTENDED_STARTUPINFO_PRESENT,
+		nullptr,
+		nullptr,
+		&startupInfo.StartupInfo,
+		&processInfo)) {
+		error = GetLastError();
+		return false;
 	}
-	::LocalFree(str);
 
-	// build process attributes
-	// for simplicity (for now), have just one  capabilities
-
-	SECURITY_CAPABILITIES sc = { 0 };
-	sc.AppContainerSid = appContainerSid;
-
-	/*
-	SID_AND_ATTRIBUTES cap;
-	BYTE sidBuffer[SECURITY_MAX_SID_SIZE];
-	PSID inetCapability = reinterpret_cast<PSID>(sidBuffer);
-	DWORD sizeSid;
-	if (!CreateWellKnownSid(WinCapabilityInternetClientSid, nullptr, inetCapability, &sizeSid))
-		return false;
-
-	cap.Sid = inetCapability;
-	cap.Attributes = SE_GROUP_ENABLED;
-	*/
-
-	STARTUPINFOEX si = { sizeof(si) };
-	PROCESS_INFORMATION pi;
-	SIZE_T size;
-
-	::InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
-	auto buffer = std::make_unique<BYTE[]>(size);
-	si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buffer.get());
-	if (!::InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &size))
-		return false;
-	if (!::UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &sc, sizeof(sc), nullptr, nullptr))
-		return false;
-
-	// set security for files/folders
-
-	int start = 0;
-	do {
-		auto filename = files.Tokenize(L"\r\n", start);
-		if (filename.IsEmpty())
-			break;
-		AllowNamedObjectAccess(appContainerSid, filename.GetBuffer(), SE_FILE_OBJECT, FILE_ALL_ACCESS);
-	} while (true);
-
-	start = 0;
-	do {
-		auto filename = registry.Tokenize(L"\r\n", start);
-		if (filename.IsEmpty())
-			break;
-		AllowNamedObjectAccess(appContainerSid, filename.GetBuffer(), SE_REGISTRY_WOW64_32KEY, KEY_ALL_ACCESS);
-	} while (true);
-
-	BOOL created = ::CreateProcess(nullptr, exePath.GetBuffer(), nullptr, nullptr, FALSE,
-		EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, (LPSTARTUPINFO)&si, &pi);
-	DeleteProcThreadAttributeList(si.lpAttributeList);
-
-	if (!created)
-		return false;
-
-	CString text;
-	text.Format(L"Created process %d\r\n", pi.dwProcessId);
-	log += text;
-
+	log += L"Created process ";
+	log += std::to_wstring(processInfo.dwProcessId);
+	log += L"\r\n";
 	return true;
+}
+
+void BrowseForExecutable(HWND dialog) {
+	std::vector<wchar_t> path(32768, L'\0');
+	OPENFILENAMEW fileDialog{};
+	fileDialog.lStructSize = sizeof(fileDialog);
+	fileDialog.hwndOwner = dialog;
+	fileDialog.lpstrFilter = L"Executables (*.exe)\0*.exe\0All files (*.*)\0*.*\0\0";
+	fileDialog.lpstrFile = path.data();
+	fileDialog.nMaxFile = static_cast<DWORD>(path.size());
+	fileDialog.lpstrDefExt = L"exe";
+	fileDialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+	if (GetOpenFileNameW(&fileDialog)) {
+		std::wstring commandLine = L"\"";
+		commandLine += path.data();
+		commandLine += L"\"";
+		SetDlgItemTextW(dialog, IDC_EXEPATH, commandLine.c_str());
+	}
+}
+
+void RunExecutable(HWND dialog) {
+	const auto containerName = GetControlText(dialog, IDC_NAME);
+	if (containerName.empty()) {
+		MessageBoxW(dialog, L"Container name cannot be empty.", L"RunAppContainer", MB_OK | MB_ICONWARNING);
+		return;
+	}
+
+	const auto commandLine = GetControlText(dialog, IDC_EXEPATH);
+	if (commandLine.empty()) {
+		MessageBoxW(dialog, L"Executable path must be specified.", L"RunAppContainer", MB_OK | MB_ICONWARNING);
+		return;
+	}
+
+	auto log = GetControlText(dialog, IDC_INFO);
+	DWORD error = ERROR_SUCCESS;
+	if (!ExecuteAppContainer(
+		containerName,
+		commandLine,
+		GetControlText(dialog, IDC_FILES),
+		GetControlText(dialog, IDC_REGISTRY),
+		log,
+		error)) {
+		const auto errorText = FormatSystemError(error);
+		log += errorText;
+		log += L"\r\n";
+		SetDlgItemTextW(dialog, IDC_INFO, log.c_str());
+		MessageBoxW(dialog, errorText.c_str(), L"RunAppContainer", MB_OK | MB_ICONERROR);
+		return;
+	}
+
+	SetDlgItemTextW(dialog, IDC_INFO, log.c_str());
+}
+
+INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM) {
+	if (message == WM_COMMAND && (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)) {
+		EndDialog(dialog, LOWORD(wParam));
+		return TRUE;
+	}
+	return FALSE;
+}
+
+HICON GetDialogIcon(HWND dialog) {
+	return reinterpret_cast<HICON>(GetWindowLongPtrW(dialog, DWLP_USER));
+}
+
+} // namespace
+
+INT_PTR CALLBACK RunAppContainerDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM) {
+	switch (message) {
+	case WM_INITDIALOG: {
+		const auto instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(dialog, GWLP_HINSTANCE));
+		const auto icon = LoadIconW(instance, MAKEINTRESOURCEW(IDR_MAINFRAME));
+		SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(icon));
+		SendMessageW(dialog, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));
+		SendMessageW(dialog, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon));
+
+		wchar_t aboutText[128]{};
+		if (LoadStringW(instance, IDS_ABOUTBOX, aboutText, ARRAYSIZE(aboutText)) != 0) {
+			if (const auto systemMenu = GetSystemMenu(dialog, FALSE)) {
+				AppendMenuW(systemMenu, MF_SEPARATOR, 0, nullptr);
+				AppendMenuW(systemMenu, MF_STRING, IDM_ABOUTBOX, aboutText);
+			}
+		}
+		return TRUE;
+	}
+
+	case WM_COMMAND:
+		switch (LOWORD(wParam)) {
+		case IDC_BROWSE:
+			if (HIWORD(wParam) == BN_CLICKED)
+				BrowseForExecutable(dialog);
+			return TRUE;
+		case IDC_RUN:
+			if (HIWORD(wParam) == BN_CLICKED)
+				RunExecutable(dialog);
+			return TRUE;
+		case IDCANCEL:
+			EndDialog(dialog, IDCANCEL);
+			return TRUE;
+		}
+		break;
+
+	case WM_SYSCOMMAND:
+		if ((wParam & 0xFFF0) == IDM_ABOUTBOX) {
+			const auto instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(dialog, GWLP_HINSTANCE));
+			DialogBoxParamW(instance, MAKEINTRESOURCEW(IDD_ABOUTBOX), dialog, AboutDialogProc, 0);
+			return TRUE;
+		}
+		break;
+
+	case WM_PAINT:
+		if (IsIconic(dialog)) {
+			PAINTSTRUCT paint{};
+			const auto dc = BeginPaint(dialog, &paint);
+			RECT client{};
+			GetClientRect(dialog, &client);
+			const int width = GetSystemMetrics(SM_CXICON);
+			const int height = GetSystemMetrics(SM_CYICON);
+			DrawIcon(dc, (client.right - width) / 2, (client.bottom - height) / 2, GetDialogIcon(dialog));
+			EndPaint(dialog, &paint);
+			return TRUE;
+		}
+		break;
+
+	case WM_QUERYDRAGICON:
+		return reinterpret_cast<INT_PTR>(GetDialogIcon(dialog));
+	}
+
+	return FALSE;
 }
